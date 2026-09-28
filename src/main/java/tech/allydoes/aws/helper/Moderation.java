@@ -106,13 +106,14 @@ public class Moderation {
 
         try {
             CompletableFuture<UpdateItemResponse> responseFuture = Database.databaseClient.updateItem(updateRequest);
-            return responseFuture.thenApply((response) -> {
-                return response.hasAttributes();
-            });
-
+            return responseFuture.thenApply(UpdateItemResponse::hasAttributes);
         } catch (DynamoDbException e) {
             LOGGER.error("Failed to upload ban", e);
             return CompletableFuture.completedFuture(false);
         }
+    }
+
+    public static CompletableFuture<Boolean> updateBannedTill(String hardwareID, String playerID) {
+
     }
 }
