@@ -5,11 +5,13 @@ import org.apache.logging.log4j.Logger;
 import software.amazon.awssdk.services.dynamodb.model.*;
 import tech.allydoes.aws.Attributes;
 import tech.allydoes.aws.Database;
+import tech.allydoes.aws.records.BanProfile;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
 public class Moderation {
@@ -17,11 +19,14 @@ public class Moderation {
 
     private static final String BAN_TABLE = "BansList";
     private static final String AWAITING_BAN_TIME = "NULL";
+    private static final String BAN_EVADING_BAN_MESSAGE = "AUTOMATED: You have been banned for ban evading.";
 
-    private static final ArrayList<String> bansToRemove = new ArrayList<>();
-    private static final LinkedHashSet<String> bansToUpdate = new LinkedHashSet<>();
+    public static final long PERMANENT_BAN = -1;
 
-    public static CompletableFuture<Boolean> checkBanAsync(String hardwareID, String playerID, boolean updateBannedTill) {
+    private static final ArrayList<BanProfile> bansToRemove = new ArrayList<>();
+    private static final LinkedHashSet<BanProfile> bansToUpdate = new LinkedHashSet<>();
+
+    public static CompletableFuture<BanProfile> getBanProfile(String hardwareID, String playerID, boolean banEvadingProtection) {
         QueryRequest hardwareIDQuery = QueryRequest.builder()
                 .tableName(BAN_TABLE)
                 .keyConditionExpression(Attributes.HARDWARE_ID + " = :hw")
@@ -42,39 +47,84 @@ public class Moderation {
         CompletableFuture<QueryResponse> hardwareIDResultFuture = Database.databaseClient.query(hardwareIDQuery);
         CompletableFuture<QueryResponse> playerIDResultFuture = Database.databaseClient.query(playerIDQuery);
 
-        return hardwareIDResultFuture.thenCombine(playerIDResultFuture, (hardwareIDResponse, playerIDResponse) -> processAndCheckPlayerBan(updateBannedTill, hardwareIDResponse) || processAndCheckPlayerBan(updateBannedTill, playerIDResponse)).exceptionally(e -> {
-            LOGGER.error("Failed to query bans list", e);
-            return false;
+        return hardwareIDResultFuture
+                .thenCombine(playerIDResultFuture, (hardwareIDResponse, playerIDResponse) -> {
+                    if (hardwareIDResponse.hasItems()) {
+                        BanProfile banProfile = parseBanProfile(hardwareIDResponse.items().getFirst());
+                        if (banEvadingProtection && !Objects.equals(banProfile.steamID(), playerID)) {
+                            return uploadBan(banProfile.hardwareID, playerID, PERMANENT_BAN, BAN_EVADING_BAN_MESSAGE).thenApply((successful) -> {
+                                if (successful) {
+                                    return new BanProfile(banProfile.hardwareID, playerID, banProfile.banTime, banProfile.message, banProfile.till);
+                                }
+
+                                return null;
+                            });
+                        }
+
+                        return banProfile;
+                    }
+
+                    if (playerIDResponse.hasItems()) {
+                        return parseBanProfile(playerIDResponse.items().getFirst());
+                    }
+
+                    return null;
+                })
+                .exceptionally((error) -> {
+                   LOGGER.error("Unable to fetch ban profile", error);
+                   return null;
+                });
+
+    }
+
+    private static BanProfile parseBanProfile(Map<String, AttributeValue> item) {
+        BanProfile banProfile = null;
+        try {
+            String hwID = item.get(Attributes.HARDWARE_ID).s();
+            String steamID = item.get(Attributes.STEAM_ID).s();
+            long banTime = Long.parseLong(item.get(Attributes.BAN_DURATION).s());
+            String message = item.get(Attributes.BAN_MESSAGE).s();
+
+            String bannedTillString = item.get(Attributes.BANNED_TILL).s();
+            long bannedTill;
+            if (Objects.equals(bannedTillString, AWAITING_BAN_TIME)) {
+                bannedTill = -1;
+            } else {
+                bannedTill = Long.parseLong(bannedTillString);
+            }
+
+            banProfile = new BanProfile(hwID, steamID, banTime, message, bannedTill);
+        } catch (NumberFormatException error) {
+            LOGGER.error("Failed to parse ban profile", error);
+        }
+
+        return banProfile;
+    }
+
+    public static CompletableFuture<Boolean> checkBan(String hardwareID, String playerID, boolean updateBannedTill) {
+        CompletableFuture<BanProfile> banProfileFuture = getBanProfile(hardwareID, playerID, updateBannedTill);
+        return banProfileFuture.thenApply((banProfile) -> {
+            if (banProfile == null) {
+                return false;
+            }
+
+            if (updateBannedTill && banProfile.till == -1L) {
+                bansToUpdate.add(banProfile);
+                return true;
+            }
+
+            if (!isValidBannedTill(banProfile.till)) {
+                bansToRemove.add(banProfile);
+                return false;
+            }
+
+            return true;
         });
     }
 
-    private static boolean processAndCheckPlayerBan(boolean updateBannedTill, QueryResponse playerIDResponse) {
-        for (Map<String, AttributeValue> item : playerIDResponse.items()) {
-            String bannedTill = item.get(Attributes.BANNED_TILL).s();
-            if (updateBannedTill && bannedTill.equalsIgnoreCase(AWAITING_BAN_TIME)) {
-                bansToUpdate.add(bannedTill);
-            }
-
-            if (isValidBanTime(bannedTill)) {
-                return true;
-            } else {
-                bansToRemove.add(item.get(Attributes.HARDWARE_ID).s());
-            }
-        }
-        return false;
-    }
-
-    private static boolean isValidBanTime(String banTime) {
-        if (banTime.equalsIgnoreCase(AWAITING_BAN_TIME)) {
+    private static boolean isValidBannedTill(long unixBanTime) {
+        if (unixBanTime == -1) {
             return true;
-        }
-
-        long unixBanTime;
-        try {
-            unixBanTime = Long.parseLong(banTime);
-        } catch (NumberFormatException e) {
-            LOGGER.error("Unable to parse bannedTill as a long", e);
-            return false;
         }
 
         long currentUnixTime = Instant.now().getEpochSecond();
@@ -83,37 +133,57 @@ public class Moderation {
 
     public static CompletableFuture<Boolean> uploadBan(String hardwareID, String playerID, long duration, String message) {
         Map<String, AttributeValue> keys = Map.of(
-                Attributes.HARDWARE_ID, AttributeValue.fromS(hardwareID)
+                Attributes.HARDWARE_ID, AttributeValue.fromS(hardwareID),
+                Attributes.STEAM_ID, AttributeValue.fromS(playerID)
         );
 
         UpdateItemRequest updateRequest = UpdateItemRequest.builder()
                 .tableName(BAN_TABLE)
                 .key(keys)
-                .updateExpression("SET #S = ")
+                .updateExpression("SET #D = :duration, #M = :message, #T = :till")
                 .expressionAttributeNames(Map.of(
-                        "#S", Attributes.STEAM_ID,
                         "#D", Attributes.BAN_DURATION,
                         "#M", Attributes.BAN_MESSAGE,
                         "#T", Attributes.BANNED_TILL
                 ))
                 .expressionAttributeValues(Map.of(
-                        ":steamID", AttributeValue.fromN(playerID),
                         ":duration", AttributeValue.fromS(String.valueOf(duration)),
                         ":message", AttributeValue.fromS(message),
-                        ":till", AttributeValue.fromS(AWAITING_BAN_TIME)
+                        ":till", AttributeValue.fromS("-1")
                 ))
                 .build();
 
-        try {
-            CompletableFuture<UpdateItemResponse> responseFuture = Database.databaseClient.updateItem(updateRequest);
-            return responseFuture.thenApply(UpdateItemResponse::hasAttributes);
-        } catch (DynamoDbException e) {
-            LOGGER.error("Failed to upload ban", e);
-            return CompletableFuture.completedFuture(false);
-        }
+        CompletableFuture<UpdateItemResponse> responseFuture = Database.databaseClient.updateItem(updateRequest);
+        return responseFuture
+                .thenApply(response -> true)
+                .exceptionally(e -> {
+                    LOGGER.error("Failed to upload ban", e);
+                    return false;
+                });
     }
 
     public static CompletableFuture<Boolean> updateBannedTill(String hardwareID, String playerID) {
+        Map<String, AttributeValue> keys = Map.of(
+                Attributes.HARDWARE_ID, AttributeValue.fromS(hardwareID),
+                Attributes.STEAM_ID, AttributeValue.fromS(playerID)
+        );
 
+        UpdateItemRequest updateRequest = UpdateItemRequest.builder()
+                .tableName(BAN_TABLE)
+                .key(keys)
+                .updateExpression("SET #B = :currentTime")
+                .expressionAttributeNames(Map.of("#B", Attributes.BANNED_TILL))
+                .expressionAttributeValues(Map.of(":currentTime", AttributeValue.fromS(String.valueOf(Instant.now().getEpochSecond()))))
+                .build();
+
+        CompletableFuture<UpdateItemResponse> responseFuture = Database.databaseClient.updateItem(updateRequest);
+        return responseFuture
+                .thenApply(response -> true)
+                .exceptionally(e -> {
+                    LOGGER.error("Failed to update banned till", e);
+                    return false;
+                });
     }
+
+    public record BanProfile(String hardwareID, String steamID, long banTime, String message, long till) {}
 }

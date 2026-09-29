@@ -5,7 +5,7 @@ import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
 import net.dv8tion.jda.api.interactions.commands.build.SlashCommandData;
 import tech.allydoes.discord.Command;
 
-public class CreatePollCommand extends Command {
+public class CreatePollCommand implements Command {
     @Override
     public SlashCommandData getCommandData() {
         return null;
