@@ -2,13 +2,14 @@ package tech.allydoes.discord.commands.moderation;
 
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
 import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
+import net.dv8tion.jda.api.interactions.commands.build.Commands;
 import net.dv8tion.jda.api.interactions.commands.build.SlashCommandData;
 import tech.allydoes.discord.Command;
 
 public class InGameBanCommand implements Command {
     @Override
     public SlashCommandData getCommandData() {
-        return null;
+        return Commands.slash("ban", "")
     }
 
     @Override

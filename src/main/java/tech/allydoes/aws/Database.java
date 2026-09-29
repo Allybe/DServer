@@ -7,4 +7,6 @@ public class Database {
     public static final DynamoDbAsyncClient databaseClient =
             DynamoDbAsyncClient.builder()
                     .build();
+
+    public static final String INDEX = "Index";
 }
